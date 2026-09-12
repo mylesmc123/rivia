@@ -32,14 +32,16 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import numpy as np
@@ -58,6 +60,112 @@ __all__ = [
     "TerrainSubLayer",
     "VrtMap",
 ]
+
+
+_READER_GRACE = 10.0
+"""Seconds allowed for the output readers to reach EOF.
+
+Shared across both readers, not granted to each: joining two threads with a
+per-thread timeout lets a stuck child consume twice the intended budget.
+"""
+
+
+def _join_pumps(pumps: list[threading.Thread], budget: float) -> list[str]:
+    """Join every pump against ONE shared deadline.
+
+    Returns the names of the threads still alive, i.e. the pipes that never
+    reached EOF.
+    """
+    deadline = time.monotonic() + budget
+    for t in pumps:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    return [t.name for t in pumps if t.is_alive()]
+
+
+def _kill_process_tree(proc: "subprocess.Popen[str]") -> None:
+    """Kill the child, and on Windows its descendants, while it is still alive.
+
+    ``Popen.kill()`` signals only the direct child.  A grandchild that inherited
+    the stdout/stderr write handles keeps the pipe open after its parent dies,
+    so the reader threads never see EOF.  On Windows ``taskkill /T`` is what
+    reaches the descendants.
+
+    **Order matters.**  ``taskkill /T`` discovers the tree by walking parent PIDs
+    outward from the process named by ``/PID``, so that process must still be
+    running when it is invoked; against an already-exited PID taskkill reports
+    "process not found" and touches nothing.  ``Popen.kill()``
+    (``TerminateProcess``) is also asynchronous, so calling it first would race
+    taskkill's discovery pass.  taskkill goes first; ``kill()`` is the fallback.
+
+    Consequently this is a **no-op once the root has exited** -- it early-returns.
+    Descendants of a naturally-exited root cannot be reclaimed this way; see the
+    ``stuck`` branch in :func:`_run_subprocess` for what happens instead.
+
+    **Never raises.**  This is called directly from the ``TimeoutExpired``
+    handler, i.e. while that exception is in flight, so anything escaping here
+    would replace it with a cleanup artefact.  ``poll()``, ``wait()``,
+    ``kill()`` and the ``logger`` calls can all raise in principle, so the
+    guarantee is made by the blanket handler rather than by the inner
+    suppressions, which only cover the *expected* failures.
+    """
+    try:
+        if proc.poll() is not None:
+            return  # root already gone; nothing here can reach its descendants
+        if sys.platform == "win32":
+            try:
+                killed = subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=_READER_GRACE,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.debug("taskkill on PID %d did not run: %s", proc.pid, exc)
+            else:
+                if killed.returncode != 0:
+                    # Benign when the tree died between poll() and taskkill;
+                    # worth seeing in a log when it is not.
+                    logger.debug(
+                        "taskkill on PID %d returned %d: %s",
+                        proc.pid,
+                        killed.returncode,
+                        killed.stderr.strip(),
+                    )
+        if proc.poll() is None:
+            with suppress(Exception):
+                proc.kill()
+        with suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_READER_GRACE)
+    except Exception:  # noqa: BLE001 - cleanup must never mask the real error
+        with suppress(Exception):
+            logger.exception("PID %d: process-tree kill failed", proc.pid)
+
+
+def _reap(proc: "subprocess.Popen[str]") -> None:
+    """Ensure the child is dead and waited for, with no unbounded wait.
+
+    **Never raises.**  This runs in a ``finally`` that may be unwinding a
+    ``TimeoutExpired``; any exception escaping here would replace the primary
+    exception with a cleanup artefact.
+
+    Deliberately does **not** touch ``proc.stdout`` / ``proc.stderr``: each pump
+    closes its own pipe in its ``finally``.  Closing a pipe from the main thread
+    while another thread is blocked reading it can itself block.  This is
+    precisely why the ``with subprocess.Popen(...) as proc:`` form is not used
+    below -- ``Popen.__exit__`` unconditionally closes both streams and then
+    calls an *unbounded* ``self.wait()``, so a bounded ``join()`` inside the
+    ``with`` block buys nothing.
+    """
+    try:
+        if proc.poll() is None:
+            _kill_process_tree(proc)
+        if proc.poll() is None:
+            logger.error("PID %d survived termination; leaking its handle", proc.pid)
+    except Exception:  # noqa: BLE001 - cleanup must never mask the real error
+        with suppress(Exception):
+            logger.exception("PID %d: teardown failed", proc.pid)
 
 
 def _run_subprocess(
@@ -79,40 +187,164 @@ def _run_subprocess(
         Working directory passed to the subprocess, or ``None`` to
         inherit the calling process's CWD.
     timeout:
-        Timeout in seconds, or ``None`` for no limit.
+        Wall-clock limit in seconds on the child process, or ``None`` for no
+        limit.  Enforced on **both** branches; exceeding it raises
+        :exc:`subprocess.TimeoutExpired` after the process tree is killed.
     stream_output:
         When ``True``, lines are read and logged in real time via
         ``subprocess.Popen``; stdout lines prefixed ``DEBUG:``/``INFO:`` by
         the stub are logged at the matching level; unprefixed lines at INFO;
         stderr at WARNING.
         When ``False``, output is captured silently via ``subprocess.run``.
+
+    Raises
+    ------
+    subprocess.TimeoutExpired
+        The child did not exit within ``timeout``.
+    RuntimeError
+        An output reader failed or never reached EOF, so the captured output
+        is partial.  Callers make retry and failure decisions by matching
+        substrings in ``stderr``, so a truncated capture is returned as an
+        error rather than as an apparently-successful result.
     """
     exe_name = Path(cmd[0]).name
     logger.debug("%s command: %s", exe_name, " ".join(cmd))
     if stream_output:
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
-        with subprocess.Popen(
+        pump_errors: list[BaseException] = []
+        tearing_down = threading.Event()
+
+        def _pump(stream: "IO[str]", sink: list[str], is_stderr: bool) -> None:
+            """Drain one pipe to EOF, logging as we go.
+
+            Must run concurrently for BOTH pipes: draining them in sequence
+            deadlocks as soon as the child fills the buffer of whichever pipe
+            we are not yet reading.
+            """
+            try:
+                for raw in stream:
+                    line = raw.rstrip()
+                    sink.append(line)
+                    if is_stderr:
+                        logger.warning("%s stderr: %s", exe_name, line)
+                    elif line.startswith("DEBUG: "):
+                        logger.debug("%s: %s", exe_name, line[7:])
+                    elif line.startswith("INFO: "):
+                        logger.info("%s: %s", exe_name, line[6:])
+                    else:
+                        logger.info("%s stdout: %s", exe_name, line)
+            except ValueError as exc:
+                # "I/O operation on closed file" is expected ONLY while we are
+                # tearing the child down.  Anywhere else it is a genuine reader
+                # failure and must be reported, not swallowed.
+                if not tearing_down.is_set():
+                    pump_errors.append(exc)
+                    logger.error("%s: output reader failed: %s", exe_name, exc)
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                pump_errors.append(exc)
+                logger.error("%s: output reader failed: %s", exe_name, exc)
+            finally:
+                # Each pipe is closed by its own reader.  The main thread must
+                # never close a pipe another thread may be blocked reading.
+                with suppress(Exception):
+                    stream.close()
+
+        # Not used as a context manager: Popen.__exit__ closes both streams and
+        # then calls an *unbounded* wait().  See _reap.
+        proc = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-        ) as proc:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line.startswith("DEBUG: "):
-                    logger.debug("%s: %s", exe_name, line[7:])
-                elif line.startswith("INFO: "):
-                    logger.info("%s: %s", exe_name, line[6:])
-                else:
-                    logger.info("%s stdout: %s", exe_name, line)
-                stdout_lines.append(line)
-            for line in proc.stderr:
-                line = line.rstrip()
-                logger.warning("%s stderr: %s", exe_name, line)
-                stderr_lines.append(line)
-            proc.wait(timeout=timeout)
+            errors="replace",
+        )
+        # PIPE guarantees these at runtime; the asserts document the invariant
+        # for mypy, which types them as `IO[str] | None`.
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        pumps = [
+            threading.Thread(
+                target=_pump,
+                args=(proc.stdout, stdout_lines, False),
+                daemon=True,
+                name=f"{exe_name}-stdout",
+            ),
+            threading.Thread(
+                target=_pump,
+                args=(proc.stderr, stderr_lines, True),
+                daemon=True,
+                name=f"{exe_name}-stderr",
+            ),
+        ]
+        stuck: list[str] = []
+        try:
+            for t in pumps:
+                t.start()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # TimeoutExpired stays the primary exception.  Kill the tree
+                # first so the pumps unblock, then let it propagate.
+                tearing_down.set()
+                _kill_process_tree(proc)
+                stuck_on_timeout = _join_pumps(pumps, _READER_GRACE)
+                if stuck_on_timeout:
+                    # taskkill did not free the pipes -- same leak as the
+                    # exited-root case below, and it must not go unreported
+                    # just because a different exception is on its way out.
+                    # Suppressed because a raising logger must not become the
+                    # exception the caller sees instead of TimeoutExpired.
+                    with suppress(Exception):
+                        logger.error(
+                            "%s: %s still blocked after the timeout kill; "
+                            "leaking %d reader thread(s) and their handles.",
+                            exe_name,
+                            ", ".join(stuck_on_timeout),
+                            len(stuck_on_timeout),
+                        )
+                raise
+            stuck = _join_pumps(pumps, _READER_GRACE)
+            if stuck:
+                # The child exited but a pipe never reached EOF -> a descendant
+                # inherited the write handle.  Nothing here can reclaim it:
+                # the root is already gone, so taskkill /T has no live process
+                # to walk the tree from (see _kill_process_tree).  Report it and
+                # leak the reader threads -- they are daemons and die with the
+                # interpreter.  Leaking is strictly better than hanging, which
+                # is the bug this function exists to remove.
+                tearing_down.set()
+                # Suppressed for the same reason as above: the caller must get
+                # the RuntimeError about partial output, not a logging failure.
+                with suppress(Exception):
+                    logger.error(
+                        "%s: %s never reached EOF after the process exited; a "
+                        "descendant is holding the pipe open. Leaking %d reader "
+                        "thread(s) and their handles.",
+                        exe_name,
+                        ", ".join(stuck),
+                        len(stuck),
+                    )
+        finally:
+            tearing_down.set()
+            _reap(proc)
+
+        # A reader that failed or never finished means the capture is partial.
+        # Partial stderr is worse than no result: the caller keys both its retry
+        # decision and its failure decision on substring matches over stderr.
+        if pump_errors:
+            raise RuntimeError(
+                f"{exe_name}: output reader failed ({pump_errors[0]!r}); "
+                f"captured output is incomplete and cannot be used to judge "
+                f"success"
+            ) from pump_errors[0]
+        if stuck:
+            raise RuntimeError(
+                f"{exe_name}: {', '.join(stuck)} never reached EOF within "
+                f"{_READER_GRACE:.0f} s of the process exiting; captured "
+                f"output is incomplete and cannot be used to judge success"
+            )
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=proc.returncode,
@@ -121,9 +353,10 @@ def _run_subprocess(
         )
     return subprocess.run(
         cmd,
-        cwd=str(cwd),
+        cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
         check=False,
     )

@@ -221,14 +221,37 @@ switch (renderMode.ToLowerInvariant())
         break;
 
     case "sloping":
-        InvokeStatic(sharedDataType, "SetSlopingRenderingMode");
+        // SetSlopingRenderingMode takes TWO flags -- (bool reduceShallowToHorizontal,
+        // bool useDepthWeightedFaces) -- by reflection against RasMapperLib.dll in HEC-RAS 6.2,
+        // 6.5, 6.6 and 7.0, none of which declares a SetSlopingPrettyRenderingMode at all.
+        // Calling it with NO arguments threw TargetParameterCountException before any work
+        // happened, failing every raster of every plan (HyKeep CamdenLakeDamBre, 2026-08-24:
+        // 462 attempted, 462 failed).
+        //
+        // The trap was VERSION-DEPENDENT and therefore silent: running the old binary shows only
+        // 6.2 and 6.3.1 actually throw -- 6.5, 6.6 and 7.0 tolerate the zero-arg call -- so this
+        // looked fine on newer installs and destroyed every raster on older ones. Pass the flags
+        // explicitly; InvokeStatic adapts to whatever arity the loaded assembly declares.
+        InvokeStatic(sharedDataType, "SetSlopingRenderingMode",
+            reduceShallowToHorizontal, useDepthWeightedFaces);
         break;
 
     case "slopingpretty":
-        // Signature: SetSlopingPrettyRenderingMode(bool reduceShallow, bool depthWeights)
-        // Matches RASMapper.XMLLoad() call order (SharedData.cs ~line 1765).
-        InvokeStatic(sharedDataType, "SetSlopingPrettyRenderingMode",
-            reduceShallowToHorizontal, useDepthWeightedFaces);
+        // Older RasMapperLib exposed this separately; newer versions fold it into the two flags
+        // of SetSlopingRenderingMode above. Prefer the dedicated method where it exists so the
+        // behaviour is unchanged on those builds, and fall back to the merged one where it does not.
+        // Argument order matches RASMapper.XMLLoad() (SharedData.cs ~line 1765).
+        if (sharedDataType.GetMethod("SetSlopingPrettyRenderingMode",
+                BindingFlags.Public | BindingFlags.Static) is not null)
+        {
+            InvokeStatic(sharedDataType, "SetSlopingPrettyRenderingMode",
+                reduceShallowToHorizontal, useDepthWeightedFaces);
+        }
+        else
+        {
+            InvokeStatic(sharedDataType, "SetSlopingRenderingMode",
+                reduceShallowToHorizontal, useDepthWeightedFaces);
+        }
         break;
 
     default:
@@ -387,6 +410,52 @@ if (useDepthWeightedFaces || tightExtent)
             }
         }
 
+        // ── 4b. Fail fast on an unusable terrain ─────────────────────────────
+        // Re-read: the fallback above may have set Terrain, or may never have
+        // run (no terrain file, or the TerrainLayer ctor did not resolve).
+        try { terrain = terrainProp?.GetValue(geometry); }
+        catch { terrain = null; }
+
+        if (terrain is null)
+        {
+            Console.Error.WriteLine(
+                "RasMapperStoreMap: error — no terrain could be resolved for this " +
+                "geometry; automatic resolution returned null and the .rasmap " +
+                "fallback did not produce one. Aborting before the map loop.");
+            return 1;
+        }
+
+        // A null check is NOT sufficient.  RasMapperLib happily resolves
+        // Geometry.Terrain to a TerrainLayer whose backing raster is absent —
+        // verified against a .rasmap whose <Terrains> entries all pointed
+        // outside the project folder.  Every StoreMap call then failed
+        // individually with "Operation failed, does <path> exist?" while the
+        // run still reported success.  SourceFileExists is the property that
+        // actually distinguishes the two cases.
+        var srcExistsProp = terrain.GetType().GetProperty(
+            "SourceFileExists", BindingFlags.Public | BindingFlags.Instance);
+        var srcNameProp = terrain.GetType().GetProperty(
+            "SourceFilename", BindingFlags.Public | BindingFlags.Instance);
+
+        bool? terrainSourceExists = null;
+        try { terrainSourceExists = srcExistsProp?.GetValue(terrain) as bool?; }
+        catch { /* leave indeterminate */ }
+
+        // Abort only when the file is *positively* known to be missing.  If the
+        // property could not be read we cannot tell, so preserve the previous
+        // behaviour rather than invent a failure.
+        if (terrainSourceExists == false)
+        {
+            string srcName = "(unknown)";
+            try { srcName = srcNameProp?.GetValue(terrain) as string ?? srcName; }
+            catch { /* keep placeholder */ }
+            Console.Error.WriteLine(
+                "RasMapperStoreMap: error — the resolved terrain's source file does " +
+                $"not exist: '{srcName}'. The .rasmap references a terrain that is " +
+                "not present on disk. Aborting before the map loop.");
+            return 1;
+        }
+
         // ── 5 & 6. FacePoint Elevation pre-computation (depth-weighted only) ──
         // Not needed for tight_extent-only; only required when
         // UseDepthWeightedFaces=true to pre-populate PerMeshFacepointElevations
@@ -464,6 +533,18 @@ if (useDepthWeightedFaces || tightExtent)
             .FirstOrDefault(m => m.Name == "StoreMap" &&
                                  m.GetParameters().Length == 2 &&
                                  m.GetParameters()[1].ParameterType == typeof(bool));
+
+        // Validate up front rather than per-layer.  Without this the call sites
+        // below used `storeMapMethod?.Invoke(...)`, which silently did nothing
+        // when the reflection lookup failed while `mapsGenerated++` still ran —
+        // reporting success for a run that generated nothing.
+        if (storeMapMethod is null)
+        {
+            Console.Error.WriteLine(
+                "RasMapperStoreMap: RASResultsMap.StoreMap(ProgressReporter, bool) " +
+                "not found in RasMapperLib — cannot generate maps.");
+            return 1;
+        }
 
         // ── Tight-extent support: resolve types for StoreMapTerrainResample ──
         //
@@ -597,12 +678,12 @@ if (useDepthWeightedFaces || tightExtent)
                             Console.Error.WriteLine(
                                 "RasMapperStoreMap: tight extent — could not resolve model " +
                                 "extent or output filename; falling back to StoreMap.");
-                            storeMapMethod?.Invoke(rasResultsMap, [progressReporterDW, false]);
+                            storeMapMethod.Invoke(rasResultsMap, [progressReporterDW, false]);
                         }
                     }
                     else
                     {
-                        storeMapMethod?.Invoke(rasResultsMap, [progressReporterDW, false]);
+                        storeMapMethod.Invoke(rasResultsMap, [progressReporterDW, false]);
                     }
 
                     mapsGenerated++;
@@ -619,7 +700,16 @@ if (useDepthWeightedFaces || tightExtent)
         Console.WriteLine(
             $"RasMapperStoreMap: {mapsGenerated} Maps generated " +
             $"for '{Path.GetFileName(resultFilename)}'.");
-        return 0;   // ← early exit — skip the StoreAllMapsCommand block below
+        if (mapsGenerated == 0)
+            Console.Error.WriteLine(
+                "RasMapperStoreMap: error — no maps were generated for " +
+                $"'{Path.GetFileName(resultFilename)}'. See the per-layer messages " +
+                "above for the cause (commonly a terrain the .rasmap references " +
+                "but which is not present on disk).");
+        // Early exit — skips the StoreAllMapsCommand block below.  Note this
+        // reports that a StoreMap call returned without throwing, NOT that a
+        // file was written; the caller validates the output VRT separately.
+        return mapsGenerated > 0 ? 0 : 1;
     }
     catch (TargetInvocationException tie) when (tie.InnerException is not null)
     {
@@ -707,11 +797,41 @@ static string Val(string arg) =>
 static bool Bool(string arg) =>
     Val(arg).Equals("true", StringComparison.OrdinalIgnoreCase);
 
+// Invoke a public static method by NAME, adapting to the arity the loaded assembly actually
+// declares. RasMapperLib's rendering-mode signatures differ across HEC-RAS releases, and binding
+// by name alone while passing a hardcoded argument list produced a bare
+// "TargetParameterCountException: Parameter count mismatch" with no clue which method or which
+// arity was expected -- see the sloping case above for what that cost. Surplus arguments are
+// dropped; being SHORT is reported loudly rather than guessed at, since padding with defaults
+// would silently change how a map is rendered.
 static void InvokeStatic(Type type, string methodName, params object[] methodArgs)
 {
     var method = type.GetMethod(methodName, BindingFlags.Public | BindingFlags.Static)
         ?? throw new InvalidOperationException($"{type.Name}.{methodName} not found.");
-    method.Invoke(null, methodArgs.Length > 0 ? methodArgs : null);
+    var parameters = method.GetParameters();
+    int want = parameters.Length, have = methodArgs?.Length ?? 0;
+
+    if (want == 0)
+    {
+        method.Invoke(null, null);
+    }
+    else if (want <= have)
+    {
+        if (want < have)
+        {
+            Console.WriteLine($"RasMapperStoreMap: {type.Name}.{methodName} takes {want} of the " +
+                              $"{have} argument(s) supplied; passing the first {want}.");
+        }
+        method.Invoke(null, methodArgs!.Take(want).ToArray());
+    }
+    else
+    {
+        var sig = string.Join(", ", parameters.Select(p => p.ParameterType.Name + " " + p.Name));
+        throw new InvalidOperationException(
+            $"{type.Name}.{methodName} expects {want} argument(s) ({sig}) but {have} were supplied. " +
+            "This HEC-RAS version's RasMapperLib declares a signature RasMapperStoreMap does not " +
+            "know how to call.");
+    }
 }
 
 // Walk the inheritance chain to find a method with the given parameter types.

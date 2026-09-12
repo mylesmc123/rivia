@@ -45,6 +45,7 @@ geo = [
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+    "pytest-timeout",
     "ruff",
     "mypy",
     "build",

@@ -404,6 +404,37 @@ def _com_progid_info(progid: str) -> dict[str, Any]:
 # Join: installed HEC-RAS (Uninstall keys) -> ProgIDs in HKCR
 # (calls your earlier find_hec_ras_installations() if you have it)
 # ---------------------------------------------------------
+def _progid_suffixes(xxx: str, parsed_version: Any) -> list[str]:
+    """Numeric ProgID suffixes to try for a HEC-RAS version, most likely first.
+
+    ras_registry_xxx() drops a zero patch, so "6.2.0.0" -> "62" and the ProgID built from it is
+    RAS62.HECRASController -- which is NOT what HEC-RAS 6.2 registers. It registers
+    RAS620.HECRASController, KEEPING the trailing zero, while 6.5/6.6/7.0 really are two-digit
+    (RAS65/RAS66/RAS70) and 6.3.1/6.4.1/5.0.7 are three (RAS631/RAS641/RAS507). HEC is not
+    consistent about it, so probe the plausible spellings instead of trusting one.
+
+    Getting this wrong is silent and expensive: a version whose ProgID is missed looks entirely
+    undrivable to callers -- installed_ras_progid() reports controller=None -- even though the
+    software is installed and registered. Downstream that reads as "this version is unavailable".
+    """
+    out = [xxx]
+    parts = [int(p) for p in re.findall(r"\d+", str(parsed_version or ""))[:3]]
+    if len(parts) >= 2:
+        major, minor = parts[0], parts[1]
+        patch = parts[2] if len(parts) > 2 else 0
+        for cand in (f"{major}{minor}{patch}", f"{major}{minor}"):
+            if cand not in out:
+                out.append(cand)
+    return out
+
+
+def _com_progid_info_any(xxx: str, parsed_version: Any, suffix: str) -> dict[str, Any]:
+    """COM info for the first REGISTERED ProgID spelling, else the info for the primary guess."""
+    infos = [_com_progid_info(f"RAS{s}.{suffix}")
+             for s in _progid_suffixes(xxx, parsed_version)]
+    return next((i for i in infos if i.get("exists")), infos[0])
+
+
 def installed_ras_progids() -> list[dict[str, Any]]:
     """
     Given a function that returns installed HEC-RAS entries (like find_hec_ras_installations()),
@@ -434,12 +465,9 @@ def installed_ras_progids() -> list[dict[str, Any]]:
         geometry = None
         flow = None
         if xxx:
-            controller_progid = f"RAS{xxx}.HECRASController"
-            geometry_progid = f"RAS{xxx}.HECRASGeometry"
-            flow_progid = f"RAS{xxx}.HECRASFlow"
-            controller = _com_progid_info(controller_progid)
-            geometry = _com_progid_info(geometry_progid)
-            flow = _com_progid_info(flow_progid)
+            controller = _com_progid_info_any(xxx, parsed_version, "HECRASController")
+            geometry = _com_progid_info_any(xxx, parsed_version, "HECRASGeometry")
+            flow = _com_progid_info_any(xxx, parsed_version, "HECRASFlow")
 
         enriched = dict(inst)
         enriched["registry_xxx"] = xxx
